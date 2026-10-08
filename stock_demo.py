@@ -7,6 +7,7 @@ from validators import is_valid_stock_code
 from validators import is_valid_date
 from prompt import build_analysis_prompt
 from llm import generate_summary
+from analysis_result import parse_analysis_result
 
 
 def main() -> None:
@@ -59,8 +60,10 @@ def main() -> None:
                 print(f"日均成交量：{metrics['average_volume']:.2f}手")
                 analysis_prompt = build_analysis_prompt(ts_code, metrics)
                 answer = generate_summary(analysis_prompt, api_key)
-                print(answer)
-
+                analysis = parse_analysis_result(answer)
+                print(analysis.summary)
+                for limitation in analysis.limitations:
+                    print(limitation)
         except httpx.TimeoutException:
             print("请求超时，请稍后再试")
 
@@ -72,6 +75,7 @@ def main() -> None:
 
         except httpx.RequestError:
             print("网路请求失败，请检查网络或代理设置")
+
 
 if __name__ == "__main__":
     main()
