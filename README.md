@@ -1,14 +1,18 @@
 # finpilot 金融研究智能体
 
-版本: v0.2
+版本: v0.4
 ### 当前功能
 可接入DeepSeek 和TUshare API，可查询深圳和上海股票代码，可查询对应股票一段时间的期初和期末收盘价，以及对应涨跌幅和日均成交量，还有DeepSeek输出的中文总结
+
+支持连续提问，输入exit退出，每条用户输入最多请求四次模型；多个工具调用顺序执行。api或工具失败时结束程序
 
 ### 运行方法
 运行前，需在终端设置环境变量TUSHARE_TOKEN和DEEPSEEK_API_KEY
 ```commandline
 uv sync
-uv run python stock_demo.py
+export DEEPSEEK_API_KEY="你的deepseek密钥"
+export TUSHARE_TOKEN="你的tushare密钥"
+uv run python tool_demo.py
 ```
 
 ### 模块职责
@@ -33,6 +37,9 @@ uv run python stock_demo.py
 ### analysis_result.py
 负责解析模型回答，验证字段类型和约束，并返回AnalysisResult对象，失败时抛异常，由入口显示提示
 
+### tool_demo.py
+当前Agent入口，负责读取配置和用户输入，定义工具，校验并执行工具调用，保存对话消息，以及运行手写Agent Loop。支持连续对话和多个工具顺序执行，并处理轮数限制和预期错误。
+
 ### 数据分析与限制
 涨跌幅百分数：(期末收盘价-期初收盘价)/期初收盘价*100，显示时追加%；使用未复权收盘价，不代表总投资收益。  
 日均成交量(手)：实际返回记录的成交量总和/实际返回记录数  
@@ -40,6 +47,11 @@ uv run python stock_demo.py
 不能仅凭日均成交量判断缩量或者放量，因为没有不同时间段的成交量对比数据  
 python计算主要负责按照代码中的逻辑分析计算获取的股票数据，llm仅负责总结获取数据的摘要
 json解析模型返回的消息是否是标准json语法，pydantic验证输出内容是否满足AnalysisResult声明的字段，类型和约束，检查finish_reason模型为什么停止生成，是否符合当前功能接受的结束状态，即使所有的检查通过，也不能保证最终输出的结果数字正确，解释合理或者是否编造内容。
+ 
 ### 模型输出
-summary是总结字符串，limitations是限制说明的字符串列表
+tool_demo.py 输出中文文本，不要求固定的 JSON 格式。
+
+旧 stock_demo.py 流程使用结构化输出：
+summary 为总结字符串，limitations 为限制说明的字符串列表。
+analysis_result.py 负责解析和校验该输出。
 
