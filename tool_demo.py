@@ -4,10 +4,12 @@ import os
 import readline
 from pydantic import BaseModel, ConfigDict
 from validators import is_valid_date, is_valid_stock_code
-from market_data import fetch_daily_prices
+from market_data import fetch_daily_prices, fetch_daily_prices_async
 from metrics import calculate_metrics
 from pandas import DataFrame
 import pandas as pd
+from time import perf_counter
+import asyncio
 
 stock_metrics_tool = {
     "type": "function",
@@ -58,6 +60,25 @@ def get_stock_metrics(arguments: StockMetricsArguments, token: str) -> dict:
     return metrics
 
 
+async def get_stock_metrics_async(
+        arguments: StockMetricsArguments,
+        token: str,
+        client: httpx.AsyncClient,
+) -> dict:
+    dataframe = await fetch_daily_prices_async(
+        ts_code=arguments.ts_code,
+        start_date=arguments.start_date,
+        end_date=arguments.end_date,
+        client=client,
+        token=token,
+    )
+    if dataframe.empty:
+        raise ValueError("没有查到行情")
+    metrics = calculate_metrics(dataframe)
+    metrics["ts_code"] = arguments.ts_code
+    return metrics
+
+
 def validate_stock_query(arguments: StockMetricsArguments) -> None:
     parts = arguments.ts_code.split(".")
     if len(parts) != 2:
@@ -72,15 +93,6 @@ def validate_stock_query(arguments: StockMetricsArguments) -> None:
 
 
 def request_stock_tool(messages: list[dict], api_key: str) -> dict:
-    for index, message in enumerate(messages):
-        content = message.get("content")
-        if isinstance(content, str):
-            try:
-                content.encode("utf-8")
-            except UnicodeEncodeError as error:
-                raise ValueError(f"第{index + 1}条消息{message["role"]}含异常字符"
-                                 f"字符位置为{error.start + 1}至{error.end}"
-                                 )from error
     headers = {
         "Authorization": f"Bearer {api_key}"
     }
@@ -102,6 +114,33 @@ def request_stock_tool(messages: list[dict], api_key: str) -> dict:
     return data["choices"][0]
 
 
+async def request_stock_tool_async(messages: list[dict], api_key: str) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    payload = {
+        "model": "deepseek-flash",
+        "messages": messages,
+        "tools": [stock_metrics_tool],
+        "tool_choice": "auto",
+        "max_tokens": 512,
+        "thinking": {"type": "disabled"},
+        "stream": False,
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.deepseek.com/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    return data["choices"][0]
+
+
 TOOL_REGISTRY = {
     "get_stock_metrics": get_stock_metrics,
 }
@@ -119,6 +158,22 @@ def execute_tool(tool_call: dict, token: str) -> dict:
     return result
 
 
+ASYNC_TOOL_REGISTRY = {
+    "get_stock_metrics": get_stock_metrics_async,
+}
+
+
+async def execute_tool_async(tool_call: dict, token: str, client: httpx.AsyncClient) -> dict:
+    tool_name = tool_call["function"]["name"]
+    if tool_name not in ASYNC_TOOL_REGISTRY:
+        raise ValueError("不支持这个工具")
+    arguments = json.loads(tool_call["function"]["arguments"])
+    validate_arguments = StockMetricsArguments.model_validate(arguments, strict=True)
+    validate_stock_query(validate_arguments)
+    tool_function = ASYNC_TOOL_REGISTRY[tool_name]
+    return await tool_function(validate_arguments, token, client)
+
+
 def run_agent(
         messages: list[dict],
         api_key: str,
@@ -128,7 +183,10 @@ def run_agent(
     if max_iterations < 1:
         raise ValueError("最大请求轮数至少为1")
     for iteration in range(max_iterations):
+        model_started_at = perf_counter()
         choice = request_stock_tool(messages, api_key)
+        model_elapsed = perf_counter() - model_started_at
+        print(f"本轮模型请求耗时：{model_elapsed:.2f}秒")
         finish_reason = choice["finish_reason"]
         print(f"第{iteration + 1}轮结束原因：{finish_reason}")
         if finish_reason == "stop":
@@ -150,11 +208,78 @@ def run_agent(
                 raise ValueError("达到最大轮请求数，任务尚未完成")
             messages.append(choice["message"])
             for tool_call in tool_calls:
+                tool_started_at = perf_counter()
                 result = execute_tool(tool_call, token)
+                tool_elapsed = perf_counter() - tool_started_at
+                print(f"本轮工具执行耗时：{tool_elapsed:.2f}秒")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": json.dumps(result, ensure_ascii=False),
+                })
+
+        elif finish_reason == "length":
+            raise ValueError("输出长度受限")
+        else:
+            raise ValueError(f"模型未正常结束{finish_reason}")
+
+    raise ValueError("任务未完成")
+
+
+async def run_agent_async(
+        messages: list[dict],
+        api_key: str,
+        token: str,
+        max_iterations: int = 4,
+) -> str:
+    if max_iterations < 1:
+        raise ValueError("最大请求轮数至少为1")
+    for iteration in range(max_iterations):
+        model_started_at = perf_counter()
+        choice = await request_stock_tool_async(messages, api_key)
+        model_elapsed = perf_counter() - model_started_at
+        print(f"本轮模型请求耗时：{model_elapsed:.2f}秒")
+        finish_reason = choice["finish_reason"]
+        print(f"第{iteration + 1}轮结束原因：{finish_reason}")
+        if finish_reason == "stop":
+            result = choice["message"]["content"]
+            if not isinstance(result, str):
+                raise ValueError("模型返回的结果非标准字符串")
+            result = result.strip()
+            if result == "":
+                raise ValueError("模型返回空内容")
+
+            messages.append(choice["message"])
+            return result
+
+        elif finish_reason == "tool_calls":
+            tool_calls = choice["message"]["tool_calls"]
+            if not tool_calls:
+                raise ValueError("模型没有返回工具调用")
+            if iteration == max_iterations - 1:
+                raise ValueError("达到最大轮请求数，任务尚未完成")
+            messages.append(choice["message"])
+            tool_started_at = perf_counter()
+            async with httpx.AsyncClient() as client:
+                tool_results = await asyncio.gather(
+                    *(
+                        execute_tool_async(tool_call, token, client)
+                        for tool_call in tool_calls
+                    ),
+                    return_exceptions=True,
+                )
+
+            tool_elapsed = perf_counter() - tool_started_at
+            print(f"本轮全部工具执行耗时：{tool_elapsed:.2f}秒")
+            for tool_result in tool_results:
+                if isinstance(tool_result, BaseException):
+                    raise tool_result
+
+            for tool_call, tool_result in zip(tool_calls, tool_results):
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": json.dumps(tool_result, ensure_ascii=False),
                 })
 
         elif finish_reason == "length":
@@ -201,8 +326,11 @@ if __name__ == "__main__":
         ]
         try:
             while True:
-                answer = run_agent(messages, api_key, tushare_token)
+                started_at = perf_counter()
+                answer = asyncio.run(run_agent_async(messages, api_key, tushare_token))
+                elapsed = perf_counter() - started_at
                 print(answer)
+                print(f"本次任务耗时：{elapsed:.2f}秒")
                 question = input("请继续输入(按 exit 退出)：").strip()
                 while not question:
                     question = input("输入内容不能为空，请重新输入").strip()
